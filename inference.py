@@ -4,11 +4,12 @@ import os
 import argparse
 from io import BytesIO
 import random
+from urllib.parse import urlparse
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-import requests  # for online image support
+from PIL import Image, UnidentifiedImageError
+import requests
 
 from dataset import Places365WithAttributes, get_default_transforms
 from model import MultiTaskResNet50
@@ -16,46 +17,41 @@ from model import MultiTaskResNet50
 # ---------------- CONFIG ----------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Same root you used in train.py (for Places365 class names)
 DATA_ROOT = r"D:\datasets\torchvision_places365"
 
-# Checkpoints
 BASE_CKPT_PATH = os.path.join("checkpoints", "best_multitask_resnet50_emission.pt")
 INTEL_CKPT_PATH = os.path.join("checkpoints", "best_multitask_resnet50_emission_intel.pt")
 
-USE_SMALL_PLACES = True   # same as in train.py
+USE_SMALL_PLACES = True
 TOP_K = 5
 
-# Human-readable emission labels (must match your dataset/emission mapping order)
-EMISSION_LABELS = [
-    "very_low",   # 0
-    "low",        # 1
-    "medium",     # 2
-    "high",       # 3
-    "very_high",  # 4
-]
+EMISSION_LABELS = ["very_low", "low", "medium", "high", "very_high"]
 
-# Intel Image Classification dataset root
 DEFAULT_INTEL_ROOT = r"D:\datasets\Intel Image Classification Dataset"
 
-# Heuristic mapping from Intel folder name -> emission class index
-# (purely for demonstration / pseudo-labels)
 INTEL_FOLDER_TO_EMISSION = {
-    "forest": 0,      # very_low
-    "glacier": 0,     # very_low
-    "mountain": 0,    # very_low
-    "sea": 1,         # low
-    "buildings": 3,   # high
-    "street": 4,      # very_high
+    "forest": 0,
+    "glacier": 0,
+    "mountain": 0,
+    "sea": 1,
+    "buildings": 3,
+    "street": 4,
 }
+
+# A friendly UA helps avoid 403 blocks from many sites
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
 # ----------------------------------------
 
 
 def load_classes():
-    """
-    Build a tiny Places365 dataset just to recover the class names.
-    No images are actually loaded here, just metadata.
-    """
     ds = Places365WithAttributes(
         root=DATA_ROOT,
         split="train-standard",
@@ -63,25 +59,22 @@ def load_classes():
         download=False,
         transform=get_default_transforms(train=False),
     )
-    classes = ds.classes  # list of class names
+    classes = ds.classes
     print(f"Loaded {len(classes)} Places365 classes.")
     return classes
 
 
 def load_model(num_scenes: int, ckpt_path: str):
-    """
-    Create model, load weights from checkpoint, move to device.
-    """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     print(f"Loading model from: {ckpt_path}")
     model = MultiTaskResNet50(num_scenes=num_scenes)
 
+    # NOTE: keep as-is; optional: weights_only=True if your ckpt supports it
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
     state_dict = ckpt["model_state_dict"]
 
-    # In case DataParallel was ever used
     if any(k.startswith("module.") for k in state_dict.keys()):
         from collections import OrderedDict
         new_sd = OrderedDict()
@@ -100,57 +93,90 @@ def load_model(num_scenes: int, ckpt_path: str):
     return model
 
 
+def _is_url(s: str) -> bool:
+    return s.startswith("http://") or s.startswith("https://")
+
+
+def _download_image_bytes(url: str, timeout: int = 20) -> bytes:
+    """
+    Robust image downloader:
+      - Adds User-Agent
+      - Follows redirects
+      - Validates Content-Type is image/*
+      - Gives clear errors when URL is HTML, blocked, etc.
+    """
+    session = requests.Session()
+    try:
+        resp = session.get(
+            url,
+            headers=DEFAULT_HEADERS,
+            timeout=timeout,
+            allow_redirects=True,
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if not ctype.startswith("image/"):
+            # Many “image” links return HTML pages. Show a helpful snippet.
+            try:
+                text_snippet = resp.text[:250].replace("\n", " ")
+            except Exception:
+                text_snippet = "<unable to read response text>"
+            raise RuntimeError(
+                f"URL did not return an image.\n"
+                f"  URL: {url}\n"
+                f"  Content-Type: {ctype}\n"
+                f"  Response starts with: {text_snippet}"
+            )
+
+        return resp.content
+
+    except requests.exceptions.HTTPError as e:
+        # Common: 403 for missing UA (we added UA), or hotlink protection.
+        raise RuntimeError(f"Failed to download image (HTTP error): {e}")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Failed to download image (request error): {e}")
+    finally:
+        session.close()
+
+
 def preprocess_image(img_path: str) -> torch.Tensor:
     """
     Load and transform an image into a tensor ready for the model.
-
     Supports:
       - Local filesystem paths
-      - HTTP/HTTPS URLs
+      - HTTP/HTTPS direct image URLs
     """
     transform = get_default_transforms(train=False)
 
-    # --- URL case ---
-    if img_path.startswith("http://") or img_path.startswith("https://"):
+    if _is_url(img_path):
         print(f"Downloading image from URL: {img_path}")
+        img_bytes = _download_image_bytes(img_path)
+
         try:
-            resp = requests.get(img_path, timeout=15)
-            resp.raise_for_status()
-        except Exception as e:
+            img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        except UnidentifiedImageError:
             raise RuntimeError(
-                f"Failed to download image from URL:\n  {img_path}\nError: {e}"
+                "Downloaded content could not be decoded as an image. "
+                "This usually means the URL returned HTML or blocked content. "
+                "Use a direct .jpg/.png/.webp link or download the file locally."
             )
 
-        img = Image.open(BytesIO(resp.content)).convert("RGB")
-
-    # --- Local file case ---
     else:
         if not os.path.isfile(img_path):
             raise FileNotFoundError(f"Image not found: {img_path}")
         img = Image.open(img_path).convert("RGB")
 
-    tensor = transform(img).unsqueeze(0)  # [1, C, H, W]
+    tensor = transform(img).unsqueeze(0)
     return tensor
 
 
 @torch.no_grad()
-def _run_on_single_image(
-    img_path: str,
-    model: torch.nn.Module,
-    classes,
-    top_k: int = TOP_K,
-):
-    """
-    Core logic: run model on ONE image path (local or URL)
-    and print predictions.
-    """
-    # 1) Preprocess image (local file or URL)
+def _run_on_single_image(img_path: str, model: torch.nn.Module, classes, top_k: int = TOP_K):
     x = preprocess_image(img_path).to(DEVICE)
-
-    # 2) Forward pass
     out = model(x)
 
-    # Support both 2-head and 3-head versions
     if isinstance(out, tuple):
         if len(out) == 3:
             scene_logits, attr_logits, emission_logits = out
@@ -162,34 +188,25 @@ def _run_on_single_image(
     else:
         raise RuntimeError(f"Unexpected model output type: {type(out)}")
 
-    # Scene probabilities
-    scene_probs = torch.softmax(scene_logits[0], dim=0)  # [num_scenes]
+    scene_probs = torch.softmax(scene_logits[0], dim=0)
     top_probs, top_idxs = torch.topk(scene_probs, k=top_k)
 
-    # Attributes (sigmoid)
     attr_probs = torch.sigmoid(attr_logits[0]).cpu().tolist()
 
     print("\n=== Scene prediction (top-{}) ===".format(top_k))
-    for rank, (p, idx) in enumerate(
-        zip(top_probs.cpu().tolist(), top_idxs.cpu().tolist()), start=1
-    ):
+    for rank, (p, idx) in enumerate(zip(top_probs.cpu().tolist(), top_idxs.cpu().tolist()), start=1):
         print(f"{rank}. {classes[idx]}  ({p*100:.2f}%)")
 
     print("\n=== Attribute probabilities ===")
     for i, p in enumerate(attr_probs):
         print(f"attr_{i}: {p:.3f}")
 
-    # Emission head (if present)
-    if "emission_logits" in locals() and emission_logits is not None:
-        emission_probs = torch.softmax(emission_logits[0], dim=0)  # [num_levels]
+    if emission_logits is not None:
+        emission_probs = torch.softmax(emission_logits[0], dim=0)
         best_idx = int(torch.argmax(emission_probs).item())
         best_p = float(emission_probs[best_idx].item())
 
-        # Clip index in case the dataset/emission mapping changed
-        if 0 <= best_idx < len(EMISSION_LABELS):
-            label = EMISSION_LABELS[best_idx]
-        else:
-            label = f"class_{best_idx}"
+        label = EMISSION_LABELS[best_idx] if 0 <= best_idx < len(EMISSION_LABELS) else f"class_{best_idx}"
 
         print("\n=== Estimated carbon emission level ===")
         print(f"Predicted: {label}  ({best_p*100:.2f}%)")
@@ -202,111 +219,11 @@ def _run_on_single_image(
 
 
 # ---------------------------------------------------------------------
-# Intel dataset helpers
+# Generic folder evaluation (works for ANY dataset folder)
 # ---------------------------------------------------------------------
-def resolve_intel_dirs(root: str):
-    """
-    Given the Intel dataset root, return (train_dir, test_dir).
-
-    Handles both:
-      root/seg_train/forest/...
-    and
-      root/seg_train/seg_train/forest/...
-    styles.
-    """
-    # Train
-    train_base = os.path.join(root, "seg_train")
-    alt_train = os.path.join(train_base, "seg_train")
-    if os.path.isdir(alt_train):
-        train_dir = alt_train
-    elif os.path.isdir(train_base):
-        train_dir = train_base
-    else:
-        raise FileNotFoundError(
-            f"Could not find Intel train folder under: {root} "
-            "(expected 'seg_train' or 'seg_train/seg_train')."
-        )
-
-    # Test (optional)
-    test_base = os.path.join(root, "seg_test")
-    alt_test = os.path.join(test_base, "seg_test")
-    if os.path.isdir(alt_test):
-        test_dir = alt_test
-    elif os.path.isdir(test_base):
-        test_dir = test_base
-    else:
-        test_dir = None  # it's fine if test split is missing
-
-    return train_dir, test_dir
-
-
-class IntelEmissionDataset(Dataset):
-    """
-    Simple dataset:
-      - walks Intel train folder (per-class subfolders)
-      - assigns a heuristic emission label per folder
-    ONLY for demonstration / pseudo-label fine-tuning.
-    """
-
-    def __init__(self, root_dir: str, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.samples = []  # list of (path, emission_label)
-
-        for cls_name in os.listdir(root_dir):
-            cls_path = os.path.join(root_dir, cls_name)
-            if not os.path.isdir(cls_path):
-                continue
-
-            if cls_name not in INTEL_FOLDER_TO_EMISSION:
-                # skip unknown class folders
-                print(
-                    f"[IntelEmissionDataset] Skipping folder '{cls_name}' "
-                    "(no emission mapping defined)."
-                )
-                continue
-
-            emm_label = INTEL_FOLDER_TO_EMISSION[cls_name]
-            for fname in os.listdir(cls_path):
-                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-                    self.samples.append(
-                        (os.path.join(cls_path, fname), emm_label)
-                    )
-
-        if not self.samples:
-            raise RuntimeError(
-                f"No usable images found in Intel train folder: {root_dir}"
-            )
-
-        print(
-            f"[IntelEmissionDataset] Collected {len(self.samples)} images "
-            f"from: {root_dir}"
-        )
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        path, emm_label = self.samples[idx]
-        img = Image.open(path).convert("RGB")
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, torch.tensor(emm_label, dtype=torch.long)
-
-
 @torch.no_grad()
-def evaluate_on_folder(
-    folder: str,
-    model: torch.nn.Module,
-    classes,
-    top_k: int = TOP_K,
-    num_images: int = 20,
-):
-    """
-    Walk a folder, pick up to `num_images` images, and run the model on each.
-    This is a simple qualitative test: no ground-truth check, just predictions.
-    """
-    exts = (".jpg", ".jpeg", ".png", ".bmp")
+def evaluate_on_folder(folder: str, model: torch.nn.Module, classes, top_k: int = TOP_K, num_images: int = 20):
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
     all_paths = []
     for dirpath, _, filenames in os.walk(folder):
         for fname in filenames:
@@ -320,10 +237,7 @@ def evaluate_on_folder(
     random.shuffle(all_paths)
     sample_paths = all_paths[: min(num_images, len(all_paths))]
 
-    print(
-        f"\nFound {len(all_paths)} images in '{folder}'. "
-        f"Running on {len(sample_paths)} sample(s)..."
-    )
+    print(f"\nFound {len(all_paths)} images in '{folder}'. Running on {len(sample_paths)} sample(s)...")
 
     for idx, img_path in enumerate(sample_paths, start=1):
         print("\n" + "-" * 80)
@@ -332,30 +246,79 @@ def evaluate_on_folder(
         _run_on_single_image(img_path, model, classes, top_k=top_k)
 
 
-def finetune_emission_on_intel(
-    train_dir: str,
-    model: torch.nn.Module,
-    epochs: int = 1,
-    batch_size: int = 32,
-    lr: float = 1e-4,
-):
-    """
-    Light fine-tuning on Intel train split using ONLY the emission head.
+# ---------------------------------------------------------------------
+# Intel dataset helpers (unchanged)
+# ---------------------------------------------------------------------
+def resolve_intel_dirs(root: str):
+    train_base = os.path.join(root, "seg_train")
+    alt_train = os.path.join(train_base, "seg_train")
+    if os.path.isdir(alt_train):
+        train_dir = alt_train
+    elif os.path.isdir(train_base):
+        train_dir = train_base
+    else:
+        raise FileNotFoundError(
+            f"Could not find Intel train folder under: {root} "
+            "(expected 'seg_train' or 'seg_train/seg_train')."
+        )
 
-    - Backbone and other heads are frozen.
-    - Emission labels are heuristic (folder-based).
-    - Saves a NEW checkpoint so we never overwrite the base model.
-    """
+    test_base = os.path.join(root, "seg_test")
+    alt_test = os.path.join(test_base, "seg_test")
+    if os.path.isdir(alt_test):
+        test_dir = alt_test
+    elif os.path.isdir(test_base):
+        test_dir = test_base
+    else:
+        test_dir = None
+
+    return train_dir, test_dir
+
+
+class IntelEmissionDataset(Dataset):
+    def __init__(self, root_dir: str, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+
+        for cls_name in os.listdir(root_dir):
+            cls_path = os.path.join(root_dir, cls_name)
+            if not os.path.isdir(cls_path):
+                continue
+
+            if cls_name not in INTEL_FOLDER_TO_EMISSION:
+                print(f"[IntelEmissionDataset] Skipping folder '{cls_name}' (no emission mapping defined).")
+                continue
+
+            emm_label = INTEL_FOLDER_TO_EMISSION[cls_name]
+            for fname in os.listdir(cls_path):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+                    self.samples.append((os.path.join(cls_path, fname), emm_label))
+
+        if not self.samples:
+            raise RuntimeError(f"No usable images found in Intel train folder: {root_dir}")
+
+        print(f"[IntelEmissionDataset] Collected {len(self.samples)} images from: {root_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, emm_label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, torch.tensor(emm_label, dtype=torch.long)
+
+
+def finetune_emission_on_intel(train_dir: str, model: torch.nn.Module, epochs: int = 1, batch_size: int = 32, lr: float = 1e-4):
     print(
         f"\n🔧 Fine-tuning emission head on Intel data:\n  train_dir = {train_dir}\n"
         f"  epochs={epochs}, batch_size={batch_size}, lr={lr:.1e}"
     )
 
-    # Freeze everything
     for p in model.parameters():
         p.requires_grad = False
 
-    # Unfreeze emission head (assumes attribute name is 'emission_head')
     if not hasattr(model, "emission_head"):
         print("⚠ Model has no 'emission_head' attribute; skipping fine-tune.")
         return
@@ -365,12 +328,13 @@ def finetune_emission_on_intel(
 
     transform = get_default_transforms(train=True)
     ds = IntelEmissionDataset(train_dir, transform=transform)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)
 
-    # Only optimize emission head parameters
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
-    )
+    # Windows-safe default: allow override with env var if you want
+    num_workers = int(os.getenv("SV_NUM_WORKERS", "0"))
+
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     criterion = torch.nn.CrossEntropyLoss()
 
     model.train()
@@ -387,9 +351,7 @@ def finetune_emission_on_intel(
 
             out = model(images)
             if not isinstance(out, tuple) or len(out) < 3:
-                raise RuntimeError(
-                    "Model output does not contain emission head while fine-tuning."
-                )
+                raise RuntimeError("Model output does not contain emission head while fine-tuning.")
 
             _, _, emission_logits = out
             loss = criterion(emission_logits, emm_labels)
@@ -404,16 +366,10 @@ def finetune_emission_on_intel(
 
         avg_loss = total_loss / max(1, total)
         acc = correct / max(1, total)
+        print(f"  [Intel FT] Epoch {ep:02d} | loss={avg_loss:.4f}, emission_acc={acc:.3f}")
 
-        print(
-            f"  [Intel FT] Epoch {ep:02d} | loss={avg_loss:.4f}, "
-            f"emission_acc={acc:.3f}"
-        )
-
-    # Back to eval mode
     model.eval()
 
-    # Save NEW checkpoint (does NOT overwrite base model)
     os.makedirs(os.path.dirname(INTEL_CKPT_PATH), exist_ok=True)
     torch.save(
         {
@@ -436,74 +392,24 @@ def parse_args():
             "Run inference with multitask Places365 model.\n"
             "Mode 1: Single image/URL (-i/--image)\n"
             "Mode 2: Qualitative test on Intel dataset (--eval-intel)\n"
-            "Mode 3: Fine-tune emission head on Intel then test (--finetune-intel)"
+            "Mode 3: Fine-tune emission head on Intel then test (--finetune-intel)\n"
+            "Mode 4: Qualitative test on ANY folder (--eval-folder)"
         )
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--image",
-        "-i",
-        type=str,
-        help="Path to input image (jpg/png) OR an HTTP/HTTPS URL.",
-    )
-    group.add_argument(
-        "--eval-intel",
-        action="store_true",
-        help="Run qualitative evaluation on Intel Image Classification dataset.",
-    )
-    group.add_argument(
-        "--finetune-intel",
-        action="store_true",
-        help=(
-            "Fine-tune the emission head on Intel train split using heuristic "
-            "labels, then run qualitative evaluation."
-        ),
-    )
+    group.add_argument("--image", "-i", type=str, help="Path to input image OR a direct HTTP/HTTPS image URL.")
+    group.add_argument("--eval-intel", action="store_true", help="Run qualitative evaluation on Intel dataset.")
+    group.add_argument("--finetune-intel", action="store_true", help="Fine-tune emission head on Intel then evaluate.")
+    group.add_argument("--eval-folder", type=str, help="Evaluate any folder of images (recursive).")
 
-    # NEW: choose which checkpoint to load (for image / eval-intel modes)
-    parser.add_argument(
-        "--use-intel-ckpt",
-        action="store_true",
-        help="Use the Intel-finetuned checkpoint instead of the base model.",
-    )
-
-    parser.add_argument(
-        "--topk",
-        type=int,
-        default=TOP_K,
-        help="How many top scene predictions to show.",
-    )
-    parser.add_argument(
-        "--intel-root",
-        type=str,
-        default=DEFAULT_INTEL_ROOT,
-        help="Root folder of the Intel Image Classification dataset.",
-    )
-    parser.add_argument(
-        "--num-images",
-        type=int,
-        default=20,
-        help="Number of Intel images to sample for eval.",
-    )
-    parser.add_argument(
-        "--ft-epochs",
-        type=int,
-        default=1,
-        help="Number of epochs when using --finetune-intel.",
-    )
-    parser.add_argument(
-        "--ft-batch",
-        type=int,
-        default=32,
-        help="Batch size when using --finetune-intel.",
-    )
-    parser.add_argument(
-        "--ft-lr",
-        type=float,
-        default=1e-4,
-        help="Learning rate when using --finetune-intel.",
-    )
+    parser.add_argument("--use-intel-ckpt", action="store_true", help="Use Intel-finetuned checkpoint instead of base.")
+    parser.add_argument("--topk", type=int, default=TOP_K, help="How many top scene predictions to show.")
+    parser.add_argument("--intel-root", type=str, default=DEFAULT_INTEL_ROOT, help="Root folder of Intel dataset.")
+    parser.add_argument("--num-images", type=int, default=20, help="Number of images to sample for eval.")
+    parser.add_argument("--ft-epochs", type=int, default=1, help="Epochs for --finetune-intel.")
+    parser.add_argument("--ft-batch", type=int, default=32, help="Batch size for --finetune-intel.")
+    parser.add_argument("--ft-lr", type=float, default=1e-4, help="Learning rate for --finetune-intel.")
 
     return parser.parse_args()
 
@@ -511,13 +417,10 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    # Load shared stuff once
     classes = load_classes()
     num_scenes = len(classes)
 
-    # ------------------- CHECKPOINT SELECTION -------------------
     if args.finetune_intel:
-        # Always start fine-tuning from the BASE model
         ckpt_path = BASE_CKPT_PATH
         print(f"📘 Using BASE Places365 checkpoint for fine-tuning: {ckpt_path}")
     else:
@@ -530,17 +433,22 @@ if __name__ == "__main__":
 
     model = load_model(num_scenes=num_scenes, ckpt_path=ckpt_path)
 
-    # ------------------- MODES -------------------
     if args.image:
-        # Single image / URL mode
         _run_on_single_image(args.image, model, classes, top_k=args.topk)
 
+    elif args.eval_folder:
+        evaluate_on_folder(
+            folder=args.eval_folder,
+            model=model,
+            classes=classes,
+            top_k=args.topk,
+            num_images=args.num_images,
+        )
+
     else:
-        # Intel dataset modes
         train_dir, test_dir = resolve_intel_dirs(args.intel_root)
 
         if args.finetune_intel:
-            # Train ONLY emission head with heuristic labels, then evaluate
             finetune_emission_on_intel(
                 train_dir=train_dir,
                 model=model,
@@ -549,7 +457,6 @@ if __name__ == "__main__":
                 lr=args.ft_lr,
             )
 
-        # Evaluate on test split if available; otherwise, on train split
         eval_dir = test_dir if test_dir is not None else train_dir
         evaluate_on_folder(
             folder=eval_dir,
