@@ -17,18 +17,24 @@ from model import MultiTaskResNet50
 # ---------------- CONFIG ----------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Dataset root (used only for loading class names initially)
 DATA_ROOT = r"D:\datasets\torchvision_places365"
 
+# Model Checkpoint Paths
 BASE_CKPT_PATH = os.path.join("checkpoints", "best_multitask_resnet50_emission.pt")
 INTEL_CKPT_PATH = os.path.join("checkpoints", "best_multitask_resnet50_emission_intel.pt")
 
 USE_SMALL_PLACES = True
-TOP_K = 5
+TOP_K = 5 # Number of top predictions to display for scene classification
 
+# Output Labels for Emission Head
 EMISSION_LABELS = ["very_low", "low", "medium", "high", "very_high"]
 
+# Default path for Intel dataset (for evaluation/finetuning)
 DEFAULT_INTEL_ROOT = r"D:\datasets\Intel Image Classification Dataset"
 
+# Intel Dataset Class Mapping (folder name -> emission level)
+# This mapping allows us to use the Intel dataset for ground-truth emission evaluation.
 INTEL_FOLDER_TO_EMISSION = {
     "forest": 0,
     "glacier": 0,
@@ -38,6 +44,7 @@ INTEL_FOLDER_TO_EMISSION = {
     "street": 4,
 }
 
+# HTTP Headers for image downloading
 # A friendly UA helps avoid 403 blocks from many sites
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -52,6 +59,10 @@ DEFAULT_HEADERS = {
 
 
 def load_classes():
+    """
+    Loads the list of scene class names from the Places365 dataset.
+    This is needed to map model output indices to human-readable names.
+    """
     ds = Places365WithAttributes(
         root=DATA_ROOT,
         split="train-standard",
@@ -65,16 +76,20 @@ def load_classes():
 
 
 def load_model(num_scenes: int, ckpt_path: str):
+    """
+    Loads the MultiTaskResNet50 model from a checkpoint.
+    """
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     print(f"Loading model from: {ckpt_path}")
     model = MultiTaskResNet50(num_scenes=num_scenes)
 
-    # NOTE: keep as-is; optional: weights_only=True if your ckpt supports it
+    # Load state dict
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
     state_dict = ckpt["model_state_dict"]
 
+    # Fix for DataParallel models (remove 'module.' prefix if present)
     if any(k.startswith("module.") for k in state_dict.keys()):
         from collections import OrderedDict
         new_sd = OrderedDict()
@@ -84,7 +99,7 @@ def load_model(num_scenes: int, ckpt_path: str):
 
     model.load_state_dict(state_dict)
     model.to(DEVICE)
-    model.eval()
+    model.eval() # Set to evaluation mode
 
     print(
         f"  Loaded checkpoint at epoch {ckpt.get('epoch', 'N/A')}, "
@@ -94,6 +109,7 @@ def load_model(num_scenes: int, ckpt_path: str):
 
 
 def _is_url(s: str) -> bool:
+    """Checks if a string looks like a URL."""
     return s.startswith("http://") or s.startswith("https://")
 
 
@@ -168,15 +184,19 @@ def preprocess_image(img_path: str) -> torch.Tensor:
             raise FileNotFoundError(f"Image not found: {img_path}")
         img = Image.open(img_path).convert("RGB")
 
-    tensor = transform(img).unsqueeze(0)
+    tensor = transform(img).unsqueeze(0) # Add batch dimension
     return tensor
 
 
 @torch.no_grad()
 def _run_on_single_image(img_path: str, model: torch.nn.Module, classes, top_k: int = TOP_K):
+    """
+    Runs inference on a single image and prints the results.
+    """
     x = preprocess_image(img_path).to(DEVICE)
     out = model(x)
 
+    # Unpack outputs based on available heads
     if isinstance(out, tuple):
         if len(out) == 3:
             scene_logits, attr_logits, emission_logits = out
@@ -188,11 +208,14 @@ def _run_on_single_image(img_path: str, model: torch.nn.Module, classes, top_k: 
     else:
         raise RuntimeError(f"Unexpected model output type: {type(out)}")
 
+    # 1. Process Scene Predictions
     scene_probs = torch.softmax(scene_logits[0], dim=0)
     top_probs, top_idxs = torch.topk(scene_probs, k=top_k)
 
+    # 2. Process Attribute Predictions
     attr_probs = torch.sigmoid(attr_logits[0]).cpu().tolist()
 
+    # Print Results
     print("\n=== Scene prediction (top-{}) ===".format(top_k))
     for rank, (p, idx) in enumerate(zip(top_probs.cpu().tolist(), top_idxs.cpu().tolist()), start=1):
         print(f"{rank}. {classes[idx]}  ({p*100:.2f}%)")
@@ -201,6 +224,7 @@ def _run_on_single_image(img_path: str, model: torch.nn.Module, classes, top_k: 
     for i, p in enumerate(attr_probs):
         print(f"attr_{i}: {p:.3f}")
 
+    # 3. Process Emission Predictions
     if emission_logits is not None:
         emission_probs = torch.softmax(emission_logits[0], dim=0)
         best_idx = int(torch.argmax(emission_probs).item())
@@ -223,6 +247,10 @@ def _run_on_single_image(img_path: str, model: torch.nn.Module, classes, top_k: 
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def evaluate_on_folder(folder: str, model: torch.nn.Module, classes, top_k: int = TOP_K, num_images: int = 20):
+    """
+    Runs qualitative evaluation on a folder of images.
+    Randomly selects 'num_images' and runs inference on them.
+    """
     exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
     all_paths = []
     for dirpath, _, filenames in os.walk(folder):
@@ -250,6 +278,10 @@ def evaluate_on_folder(folder: str, model: torch.nn.Module, classes, top_k: int 
 # Intel dataset helpers (unchanged)
 # ---------------------------------------------------------------------
 def resolve_intel_dirs(root: str):
+    """
+    Locates the 'seg_train' and 'seg_test' folders within the Intel dataset root.
+    Handles potential nested directory structures.
+    """
     train_base = os.path.join(root, "seg_train")
     alt_train = os.path.join(train_base, "seg_train")
     if os.path.isdir(alt_train):
@@ -275,6 +307,10 @@ def resolve_intel_dirs(root: str):
 
 
 class IntelEmissionDataset(Dataset):
+    """
+    Custom Dataset for the Intel Image Classification dataset.
+    Used for fine-tuning the emission head.
+    """
     def __init__(self, root_dir: str, transform=None):
         self.root_dir = root_dir
         self.transform = transform
@@ -311,11 +347,16 @@ class IntelEmissionDataset(Dataset):
 
 
 def finetune_emission_on_intel(train_dir: str, model: torch.nn.Module, epochs: int = 1, batch_size: int = 32, lr: float = 1e-4):
+    """
+    Fine-tunes ONLY the carbon emission head on the Intel dataset.
+    The backbone and other heads are frozen.
+    """
     print(
         f"\n🔧 Fine-tuning emission head on Intel data:\n  train_dir = {train_dir}\n"
         f"  epochs={epochs}, batch_size={batch_size}, lr={lr:.1e}"
     )
 
+    # Freeze all parameters first
     for p in model.parameters():
         p.requires_grad = False
 
@@ -323,6 +364,7 @@ def finetune_emission_on_intel(train_dir: str, model: torch.nn.Module, epochs: i
         print("⚠ Model has no 'emission_head' attribute; skipping fine-tune.")
         return
 
+    # Unfreeze only the emission head
     for p in model.emission_head.parameters():
         p.requires_grad = True
 
@@ -370,6 +412,7 @@ def finetune_emission_on_intel(train_dir: str, model: torch.nn.Module, epochs: i
 
     model.eval()
 
+    # Save the fine-tuned model
     os.makedirs(os.path.dirname(INTEL_CKPT_PATH), exist_ok=True)
     torch.save(
         {
@@ -417,9 +460,11 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
+    # 1. Load class names
     classes = load_classes()
     num_scenes = len(classes)
 
+    # 2. Determine which checkpoint to load
     if args.finetune_intel:
         ckpt_path = BASE_CKPT_PATH
         print(f"📘 Using BASE Places365 checkpoint for fine-tuning: {ckpt_path}")
@@ -433,6 +478,7 @@ if __name__ == "__main__":
 
     model = load_model(num_scenes=num_scenes, ckpt_path=ckpt_path)
 
+    # 3. Execute requested mode
     if args.image:
         _run_on_single_image(args.image, model, classes, top_k=args.topk)
 
@@ -446,6 +492,7 @@ if __name__ == "__main__":
         )
 
     else:
+        # Intel Dataset operations
         train_dir, test_dir = resolve_intel_dirs(args.intel_root)
 
         if args.finetune_intel:

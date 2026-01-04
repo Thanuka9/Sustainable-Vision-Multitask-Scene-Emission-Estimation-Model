@@ -14,56 +14,61 @@ from dataset import Places365WithAttributes, get_default_transforms
 from model import MultiTaskResNet50
 
 # ------------------------------------------------------------------
-# CONFIG
+# CONFIGURATION
 # ------------------------------------------------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if DEVICE.type == "cuda":
-    torch.backends.cudnn.benchmark = True  # speed up convs for fixed image size
+    torch.backends.cudnn.benchmark = True  # Optimized for fixed image size
 
-# Where TorchVision will download Places365 data:
-DATA_ROOT = r"D:\datasets\torchvision_places365"
+# Data paths
+DATA_ROOT = r"D:\datasets\torchvision_places365" # Where TorchVision will find/download Places365
 
-# Directory to save checkpoints & plots
+# Checkpoint directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAVE_DIR = os.path.join(BASE_DIR, "checkpoints")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# ❌ We do NOT resume from old checkpoints here because the model
-# architecture has changed (extra emission head).
+# Resume capability (set to a path to resume training)
 RESUME_FROM_CHECKPOINT: Optional[str] = None
 
-# Training config (FINAL MODEL)
+# Training hyperparameters (FINAL MODEL CONFIG)
 BASE_BATCH_SIZE = 32
-BASE_NUM_WORKERS = 4          # use multiple workers to speed up loading (lower to 0/2 if issues)
+BASE_NUM_WORKERS = 4          # DataLoader workers (adjust based on CPU)
 BASE_NUM_EPOCHS = 15
-PATIENCE = 5                  # early stopping patience
+PATIENCE = 5                  # Early stopping patience (epochs without improvement)
 
-# Loss weights
-LAMBDA_ATTR = 1.3691009043636835   # from your best Optuna trial
-LAMBDA_EMISSION = 1.0              # weight for carbon-emission head
+# Loss weighting (balancing the multi-task loss)
+# Total Loss = Scene_Loss + (LAMBDA_ATTR * Attr_Loss) + (LAMBDA_EMISSION * Emission_Loss)
+LAMBDA_ATTR = 1.3691009043636835   # Tuned value
+LAMBDA_EMISSION = 1.0              # Default weight
 
-# Optuna config (turned OFF for final training)
-USE_OPTUNA = False
+# Optuna (Hyperparameter Tuning) config
+USE_OPTUNA = False # Set to True to run hyperparameter search instead of training
 N_TRIALS = 10
 TUNE_EPOCHS = 8
 
-# Limit samples
+# Dataset limits (for faster debugging/prototyping, set to None for full dataset)
 MAX_TRAIN_SAMPLES = 300_000
 MAX_VAL_SAMPLES = 30_000
 
-# Use smaller 256x256 version of Places365
+# Use smaller 256x256 version of Places365 (saves bandwidth/disk)
 USE_SMALL_PLACES = True
 # ------------------------------------------------------------------
 
 
 def compute_attribute_stats(preds: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
     """
-    preds: probabilities [N, 4]
-    targets: 0/1 tensor [N, 4]
-    returns macro precision, recall, f1
+    Computes precision, recall, and F1 score for multi-label attribute prediction.
+
+    Args:
+        preds (Tensor): Probabilities [N, 4]
+        targets (Tensor): Ground truth 0/1 [N, 4]
+
+    Returns:
+        Dict with 'precision', 'recall', 'f1'.
     """
     eps = 1e-8
-    preds_bin = (preds > 0.5).float()
+    preds_bin = (preds > 0.5).float() # Threshold at 0.5
 
     tp = (preds_bin * targets).sum(dim=0)
     fp = (preds_bin * (1 - targets)).sum(dim=0)
@@ -73,6 +78,7 @@ def compute_attribute_stats(preds: torch.Tensor, targets: torch.Tensor) -> Dict[
     recall = tp / (tp + fn + eps)
     f1 = 2 * precision * recall / (precision + recall + eps)
 
+    # Return macro-averaged stats (average across all attributes)
     return {
         "precision": precision.mean().item(),
         "recall": recall.mean().item(),
@@ -90,6 +96,9 @@ def train_epoch(
     lambda_emission: float,
     optimizer: torch.optim.Optimizer,
 ):
+    """
+    Runs one epoch of training.
+    """
     model.train()
     total_loss = 0.0
     correct_scene = 0
@@ -100,6 +109,7 @@ def train_epoch(
     all_attr_targets = []
 
     for batch in loader:
+        # Move data to GPU/device
         images = batch["image"].to(DEVICE, non_blocking=True)
         scene_labels = batch["scene_label"].to(DEVICE, non_blocking=True)
         attr_labels = batch["attribute_label"].to(DEVICE, non_blocking=True)
@@ -107,35 +117,39 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        # 3-head model
+        # Forward pass (get outputs for all 3 heads)
         scene_logits, attr_logits, emission_logits = model(images)
 
+        # Calculate individual losses
         loss_scene = scene_loss_fn(scene_logits, scene_labels)
         loss_attr = attr_loss_fn(attr_logits, attr_labels)
         loss_emission = emission_loss_fn(emission_logits, emission_labels)
 
+        # Weighted sum of losses
         loss = loss_scene + lambda_attr * loss_attr + lambda_emission * loss_emission
 
+        # Backpropagation
         loss.backward()
         optimizer.step()
 
+        # Track metrics
         batch_size = images.size(0)
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
-        # scene accuracy
+        # Accuracy tracking
         _, pred_scene = torch.max(scene_logits, dim=1)
         correct_scene += (pred_scene == scene_labels).sum().item()
 
-        # emission accuracy
         _, pred_emission = torch.max(emission_logits, dim=1)
         correct_emission += (pred_emission == emission_labels).sum().item()
 
-        # attributes
+        # Attribute predictions (store for epoch-level F1 calc)
         attr_probs = torch.sigmoid(attr_logits).detach().cpu()
         all_attr_preds.append(attr_probs)
         all_attr_targets.append(attr_labels.cpu())
 
+    # Aggregate epoch metrics
     avg_loss = total_loss / max(1, total_samples)
     scene_acc = correct_scene / max(1, total_samples)
     emission_acc = correct_emission / max(1, total_samples)
@@ -157,6 +171,10 @@ def eval_epoch(
     lambda_attr: float,
     lambda_emission: float,
 ):
+    """
+    Runs evaluation on the validation set.
+    Similar to train_epoch but without backprop/optimization.
+    """
     model.eval()
     total_loss = 0.0
     correct_scene = 0
@@ -207,8 +225,7 @@ def eval_epoch(
 
 def _maybe_limit_dataset(ds, max_samples: Optional[int]):
     """
-    If max_samples is set and smaller than len(ds),
-    return a Subset with randomly sampled indices.
+    Helper to subset a dataset for faster testing/debugging.
     """
     if max_samples is None or max_samples <= 0 or max_samples >= len(ds):
         return ds
@@ -219,8 +236,8 @@ def _maybe_limit_dataset(ds, max_samples: Optional[int]):
 
 def build_dataloaders(batch_size: int, num_workers: int):
     """
-    Create train/val datasets + loaders for Places365 and return them + num_scenes.
-    Automatically disables downloading if data already exists.
+    Sets up the Places365 dataset, applies transforms, and creates DataLoaders.
+    Handles dataset limiting if configured.
     """
     transform_train = get_default_transforms(train=True)
     transform_val = get_default_transforms(train=False)
@@ -230,6 +247,7 @@ def build_dataloaders(batch_size: int, num_workers: int):
         expected_dir = os.path.join(root, folder)
         return os.path.exists(expected_dir)
 
+    # Avoid re-downloading if folder exists
     skip_download = dataset_exists(DATA_ROOT, USE_SMALL_PLACES)
 
     train_ds = Places365WithAttributes(
@@ -248,6 +266,7 @@ def build_dataloaders(batch_size: int, num_workers: int):
         transform=transform_val,
     )
 
+    # Limit dataset size if configured (for debugging)
     train_ds = _maybe_limit_dataset(train_ds, MAX_TRAIN_SAMPLES)
     val_ds = _maybe_limit_dataset(val_ds, MAX_VAL_SAMPLES)
 
@@ -286,6 +305,9 @@ def build_dataloaders(batch_size: int, num_workers: int):
 
 
 def plot_curves(history: Dict[str, list], save_dir: str = SAVE_DIR, suffix: str = "") -> None:
+    """
+    Plots training history (loss, accuracy, F1) and saves to disk.
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     epochs = range(1, len(history["train_loss"]) + 1)
@@ -359,8 +381,9 @@ def train_model(
     resume_from: Optional[str] = None,
 ):
     """
-    Train a model with given hyperparameters.
-    Returns (best_val_loss, history or None).
+    Main training function.
+    Initializes model, optimizer, and runs the training loop.
+    Supports early stopping and saving the best model.
     """
     print(
         f"\n🔧 Training with lr={lr:.2e}, weight_decay={weight_decay:.2e}, "
@@ -380,14 +403,16 @@ def train_model(
 
     model = model.to(DEVICE)
 
+    # Define loss functions for each task
     scene_loss_fn = nn.CrossEntropyLoss()
     attr_loss_fn = nn.BCEWithLogitsLoss()
     emission_loss_fn = nn.CrossEntropyLoss()
+
     optimizer = torch.optim.Adam(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
 
-    # Resume only if you explicitly set resume_from (currently None)
+    # Load checkpoint if resuming
     if resume_from is not None and os.path.isfile(resume_from):
         ckpt = torch.load(resume_from, map_location=DEVICE)
         state_dict = ckpt["model_state_dict"]
@@ -421,6 +446,7 @@ def train_model(
             "val_attr_f1": [],
         }
 
+    # Training Loop
     for epoch in range(1, num_epochs + 1):
         start = time.time()
 
@@ -446,6 +472,7 @@ def train_model(
 
         dt = time.time() - start
 
+        # Record history
         if history is not None:
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val_loss)
@@ -474,6 +501,7 @@ def train_model(
             f"R={val_attr['recall']:.3f}"
         )
 
+        # Check for improvement (Early Stopping)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
@@ -513,8 +541,8 @@ def train_model(
 
 def objective(trial: optuna.Trial) -> float:
     """
-    Optuna objective: tune lr, weight_decay, lambda_attr.
-    Emission loss weight kept fixed.
+    Optuna objective function for hyperparameter tuning.
+    Searches for best lr, weight_decay, and lambda_attr.
     """
     lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
@@ -547,6 +575,7 @@ def main():
     print(f"Checkpoints: {SAVE_DIR}")
 
     if USE_OPTUNA:
+        # 1. Hyperparameter Tuning Mode
         print("\n🚀 Running Optuna hyperparameter search on Places365...")
         study = optuna.create_study(direction="minimize")
         study.optimize(objective, n_trials=N_TRIALS)
@@ -580,6 +609,7 @@ def main():
 
         print(f"\n✅ Final best val loss (optuna model): {best_val_loss:.4f}")
     else:
+        # 2. Standard Training Mode (using known best params)
         print("\n▶ Running FINAL training with best hyperparameters (from previous Optuna run)...")
 
         lr = 3.177436480338081e-05
