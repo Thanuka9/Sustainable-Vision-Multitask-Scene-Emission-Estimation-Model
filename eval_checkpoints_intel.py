@@ -28,6 +28,7 @@ DEFAULT_INTEL_TEST_DIR = r"D:\datasets\Intel Image Classification Dataset\seg_te
 
 
 def strip_module_prefix(state_dict):
+    """Utility to handle DataParallel state dicts by removing 'module.' prefix."""
     if any(k.startswith("module.") for k in state_dict.keys()):
         return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
     return state_dict
@@ -35,8 +36,8 @@ def strip_module_prefix(state_dict):
 
 class IntelEmissionTestDataset(Dataset):
     """
-    Uses seg_test folder labels as emission labels via INTEL_FOLDER_TO_EMISSION.
-    This gives us a consistent way to compare checkpoints.
+    Dataset class for evaluating on the Intel Image Classification dataset's test split.
+    Uses folder names to derive ground-truth emission labels.
     """
     def __init__(self, root_dir: str, transform=None):
         self.root_dir = root_dir
@@ -74,6 +75,10 @@ class IntelEmissionTestDataset(Dataset):
 
 @torch.no_grad()
 def eval_checkpoint(ckpt_path: str, num_scenes: int, loader: DataLoader):
+    """
+    Evaluates a single checkpoint on the Intel test dataset.
+    Returns accuracy stats or None if the model is incompatible.
+    """
     model = MultiTaskResNet50(num_scenes=num_scenes).to(DEVICE)
 
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
@@ -163,6 +168,7 @@ def main():
         print("No comparable checkpoints found (none produced emission logits).")
         return
 
+    # Sort results by accuracy (highest first)
     results.sort(key=lambda x: x[1], reverse=True)
 
     print("\n=== Leaderboard (best -> worst) ===")

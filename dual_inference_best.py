@@ -14,6 +14,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_ROOT = r"D:\datasets\torchvision_places365"
 USE_SMALL_PLACES = True
 
+# Paths to the two model checkpoints
 BASE_CKPT = r"checkpoints\best_multitask_resnet50_emission.pt"
 INTEL_CKPT = r"checkpoints\best_multitask_resnet50_emission_intel.pt"
 
@@ -38,6 +39,7 @@ DEFAULT_GRID_G_PER_KWH = 445.0
 # Building EUI is context-specific; keep it configurable.
 DEFAULT_BUILDING_EUI_KWH_PER_M2_YR = 120.0
 
+# Multipliers to scale base intensity by predicted emission level
 LABEL_MULTIPLIER = {
     "very_low": 0.3,
     "low": 0.6,
@@ -47,6 +49,7 @@ LABEL_MULTIPLIER = {
 }
 
 # Keywords for weighted scene typing
+# Used to categorize the scene into broad types (transport, built, industrial, nature)
 TRANSPORT_KW = [
     "street", "highway", "downtown", "crosswalk", "parking", "intersection", "road", "alley", "bridge"
 ]
@@ -62,6 +65,7 @@ NATURE_KW = [
 
 
 def load_classes():
+    """Load scene class names from dataset."""
     ds = Places365WithAttributes(
         root=DATA_ROOT,
         split="train-standard",
@@ -74,12 +78,14 @@ def load_classes():
 
 
 def strip_module_prefix(state_dict):
+    """Remove 'module.' prefix from state_dict keys (fix for DataParallel)."""
     if any(k.startswith("module.") for k in state_dict.keys()):
         return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
     return state_dict
 
 
 def load_model(num_scenes, ckpt_path):
+    """Load a model from a checkpoint file."""
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
@@ -96,6 +102,7 @@ def load_model(num_scenes, ckpt_path):
 
 
 def _download_image_bytes(url: str) -> bytes:
+    """Download image bytes with robustness checks."""
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -113,6 +120,7 @@ def _download_image_bytes(url: str) -> bytes:
 
 
 def preprocess_image(img_input: str):
+    """Load and transform image from path or URL."""
     transform = get_default_transforms(train=False)
 
     if img_input.startswith("http://") or img_input.startswith("https://"):
@@ -131,6 +139,10 @@ def preprocess_image(img_input: str):
 
 
 def is_intel_domain(img_input: str) -> bool:
+    """
+    Heuristic to check if the input image path belongs to the Intel dataset.
+    Used to auto-select the Intel-finetuned model.
+    """
     s = img_input.lower()
     if "intel image classification dataset" in s:
         return True
@@ -142,6 +154,13 @@ def is_intel_domain(img_input: str) -> bool:
 
 @torch.no_grad()
 def predict(model, x, classes, topk=TOPK_DEFAULT):
+    """
+    Run inference and return structured results including:
+    - Best emission label
+    - Probability score
+    - Confidence gap (difference between top 1 and top 2)
+    - Top-k scene predictions
+    """
     x = x.to(DEVICE)
     scene_logits, attr_logits, emission_logits = model(x)
 
@@ -169,7 +188,9 @@ def predict(model, x, classes, topk=TOPK_DEFAULT):
 
 def weighted_scene_type(scenes):
     """
-    Uses top-k weighted votes to reduce errors like 'mosque/outdoor' dominating.
+    Determines the broad scene type (Transport, Built, Industrial, Nature)
+    by aggregating probability scores of top-k scene predictions.
+    Uses keywords defined in TRANSPORT_KW, BUILT_KW, etc.
     """
     score = {"transport": 0.0, "built": 0.0, "industrial": 0.0, "nature": 0.0}
 
@@ -193,6 +214,11 @@ def weighted_scene_type(scenes):
 
 
 def estimate_co2_intensity(chosen_out, grid_g_per_kwh, building_eui_kwh_m2_yr):
+    """
+    Estimates numeric CO2 intensity based on scene type and emission level.
+    Uses standard reference values (EPA, etc.) and scales them by the
+    predicted emission level multiplier.
+    """
     scene_type = weighted_scene_type(chosen_out["scenes"])
     label = chosen_out["label"]
     mult = LABEL_MULTIPLIER.get(label, 1.0)
@@ -219,22 +245,21 @@ def estimate_co2_intensity(chosen_out, grid_g_per_kwh, building_eui_kwh_m2_yr):
 
 def model_score(out, prefer_base_bias=0.0):
     """
-    Conservative scoring:
-    - Primary: emission probability
-    - Secondary: confidence gap
-    - Optional: bias (used to prefer BASE in AUTO mode)
+    Calculates a confidence score for a model's prediction.
+    Score = Probability + (0.25 * Gap) + Bias
     """
     return (out["prob"] * 1.00) + (out["gap"] * 0.25) + prefer_base_bias
 
 
 def choose_best_output(img_input, base_out, intel_out, selector="auto", prefer_base=True):
     """
-    FIXED selection logic:
-    - selector=base or intel forces one model
-    - selector=auto:
-        * Intel path -> Intel
-        * Else: default BASE (prevents Intel dominating out-of-domain)
-        * Switch to Intel only if Intel is clearly stronger AND not contradictory
+    Decides whether to trust the BASE model or the INTEL model.
+
+    Logic:
+    - If selector is explicit ('base' or 'intel'), use that.
+    - If 'auto':
+      - If input path looks like Intel dataset -> Use Intel model.
+      - Otherwise, prefer BASE model (conservative) unless Intel model is significantly more confident.
     """
     if selector == "base":
         return "BASE_PLACES", base_out
@@ -265,6 +290,7 @@ def choose_best_output(img_input, base_out, intel_out, selector="auto", prefer_b
 
 
 def print_block(name, out, topk):
+    """Print results for a single model."""
     print(f"\n--- {name} ---")
     print(f"Emission: {out['label']} ({out['prob']*100:.2f}%) | gap={out['gap']*100:.2f}%")
     print(f"Scene-type (weighted): {weighted_scene_type(out['scenes'])}")
@@ -274,6 +300,7 @@ def print_block(name, out, topk):
 
 
 def print_final(chosen_name, out, topk, co2_est):
+    """Print the final chosen result and CO2 estimation."""
     print("\n==============================")
     print("✅ FINAL OUTPUT (AUTO selection)")
     print("==============================")
